@@ -47,9 +47,9 @@ jobs:
         run: go vet $GO_PKGS
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.62.2
+          version: v2.13.2
           args: --timeout 5m
 
   # ===========================================================================
@@ -233,7 +233,7 @@ jobs:
 
       # QUALITY GATE: CRITICAL seviyesinde açık varsa build başarısız olur.
       - name: Trivy taraması (Go servisi)
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: integration-hub/admin-api:ci
           format: table
@@ -242,7 +242,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Trivy taraması (Admin UI)
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: integration-hub/admin-ui:ci
           format: table
