@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindmons.local/schemas/verification.completed@1.json",
+  "title": "verification.completed v1",
+  "description": "Regülasyon/doğrulama tool'u bir kontrolü tamamladığında yayınlanır. 'failed' sonuçların operasyon ekibine, 'manual_review' sonuçların inceleme kuyruğuna yönlendirilmesi tipik bir kural örneğidir.",
+  "type": "object",
+  "required": ["verification_id", "subject_id", "result"],
+  "additionalProperties": true,
+  "properties": {
+    "verification_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "subject_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Doğrulanan varlığın kimliği (kullanıcı, belge veya işlem)."
+    },
+    "subject_type": {
+      "type": "string",
+      "enum": ["user", "document", "transaction"]
+    },
+    "result": {
+      "type": "string",
+      "enum": ["passed", "failed", "manual_review"]
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Güven skoru. Sayısal karşılaştırma operatörleriyle (gte/lt) filtrelenebilir."
+    },
+    "regulation": {
+      "type": "string",
+      "description": "Uygulanan regülasyon çerçevesi (KVKK, GDPR, AML)."
+    }
+  }
+}

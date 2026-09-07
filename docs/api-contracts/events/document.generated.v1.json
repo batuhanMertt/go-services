@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindmons.local/schemas/document.generated@1.json",
+  "title": "document.generated v1",
+  "description": "Belge üretim tool'u bir belgeyi tamamladığında yayınlanır. Tipik akış: belge üretilir → doğrulama tool'u bu event'e abone olup regülasyon kontrolü başlatır.",
+  "type": "object",
+  "required": ["document_id", "document_type", "status"],
+  "additionalProperties": true,
+  "properties": {
+    "document_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "document_type": {
+      "type": "string",
+      "enum": ["invoice", "contract", "report", "certificate"]
+    },
+    "owner_user_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "final", "archived"],
+      "description": "Yalnızca 'final' belgelerin arşiv servisine gönderilmesi gibi kurallar bu alanla kurulur."
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "storage_url": {
+      "type": "string",
+      "description": "Belgenin saklandığı konum. Event payload'ında belgenin KENDİSİ taşınmaz — sadece referansı (Claim Check deseni)."
+    }
+  }
+}

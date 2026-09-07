@@ -1,0 +1,805 @@
+# =============================================================================
+# MindMons Integration & Event Hub — tam yığın
+#
+#   cp .env.example .env && docker compose up -d --build
+#
+# Tasarım kuralları (görev tanımından):
+#   - Tek komutla ayağa kalkar, manuel kurulum adımı yok.
+#   - Hiçbir image `latest` etiketiyle çekilmez (reproducibility).
+#   - Her servisin healthcheck'i, CPU/bellek limiti ve log rotation'ı var.
+#   - Başlangıç sırası depends_on + service_healthy ile yönetilir.
+#   - Tüm yapılandırma .env üzerinden; kodda hardcoded değer yok.
+#   - Go servisleri distroless/nonroot image'larda çalışır.
+# =============================================================================
+
+# --- Yeniden kullanılan bloklar ----------------------------------------------
+
+# Log rotation: sınırsız log dosyası diski doldurur. 3 × 10 MB = servis başına
+# en fazla 30 MB.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Go servislerinin ortak yapılandırması.
+x-go-service: &go-service
+  restart: unless-stopped
+  logging: *default-logging
+  networks: [hub-net]
+
+# Tüm Go servislerinin paylaştığı ortam değişkenleri.
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-dev}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  LOG_JSON: ${LOG_JSON:-true}
+  POSTGRES_DB: ${POSTGRES_DB}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  REDIS_DB: ${REDIS_DB:-0}
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC_INGESTED: ${KAFKA_TOPIC_INGESTED:-events.ingested}
+  KAFKA_TOPIC_DELIVERY: ${KAFKA_TOPIC_DELIVERY:-events.delivery}
+  KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-events.dlq}
+  DB_MAX_CONNS: ${DB_MAX_CONNS:-10}
+  DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-10s}
+  HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-10s}
+  HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-15s}
+  HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-60s}
+  HTTP_SHUTDOWN_TIMEOUT: ${HTTP_SHUTDOWN_TIMEOUT:-20s}
+
+networks:
+  hub-net:
+    name: integration-hub-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  pgadmin-data:
+  publisher-creds:
+
+services:
+
+  # ===========================================================================
+  # ALTYAPI
+  # ===========================================================================
+
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: hub-postgres
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Servis rollerinin şifresi — init script'i tarafından kullanılır.
+      DB_SERVICE_PASSWORD: ${DB_SERVICE_PASSWORD}
+      # Türkçe karakterlerin doğru sıralanması için.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Yalnızca ilk açılışta (veri dizini boşken) çalışır.
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - log_min_duration_statement=500   # 500 ms üzeri sorguları logla
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+        reservations: { memory: 256M }
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: hub-redis
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    # Parola runtime'da veriliyor: build arg olsaydı image katmanında kalırdı.
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  # Kafka veri dizininin sahipliğini ayarlar. Named volume root'a ait olarak
+  # oluşur; Kafka ise non-root (uid 1000) çalıştığı için yazamaz.
+  # Bu init container tek işi yapıp çıkar — Kafka'nın root olarak çalışmasına
+  # gerek kalmaz (NFR-3.3).
+  kafka-perms:
+    image: busybox:1.37
+    container_name: hub-kafka-perms
+    networks: [hub-net]
+    logging: *default-logging
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /var/lib/kafka/data && chown -R 1000:1000 /var/lib/kafka"]
+    volumes:
+      - kafka-data:/var/lib/kafka
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: hub-kafka
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      kafka-perms:
+        condition: service_completed_successfully
+    ports:
+      # Host'tan erişim (yerel test araçları için). Container içi iletişim 9092.
+      - "${KAFKA_HOST_PORT:-9094}:9094"
+    environment:
+      # --- KRaft modu: Zookeeper YOK ---------------------------------------
+      # Gerekçe: tek proses, ~300 MB daha az bellek, daha basit operasyon.
+      # Zookeeper Kafka 4.0'da tamamen kaldırıldı; bugün yeni kurulumda
+      # Zookeeper seçmek bilinçli bir teknik borç olurdu.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # --- Tek broker'lı dev kümesi ----------------------------------------
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # --- Otomatik topic oluşturma KAPALI ---------------------------------
+      # Üretimde doğru yaklaşım budur: bir yazım hatası yanlış partition
+      # sayısıyla sessizce topic yaratmasın. Topic'ler kafka-init ile açılır.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-6}
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
+    volumes:
+      - kafka-data:/var/lib/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "1.5", memory: 1G }
+        reservations: { memory: 512M }
+
+  # Topic'leri açılışta oluşturur ve çıkar. İdempotent — her `up` çalışabilir.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: hub-kafka-init
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC_INGESTED: ${KAFKA_TOPIC_INGESTED:-events.ingested}
+      KAFKA_TOPIC_DELIVERY: ${KAFKA_TOPIC_DELIVERY:-events.delivery}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-events.dlq}
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-6}
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
+      KAFKA_RETENTION_MS: ${KAFKA_RETENTION_MS:-604800000}
+      KAFKA_DLQ_RETENTION_MS: ${KAFKA_DLQ_RETENTION_MS:-2592000000}
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    restart: "no"
+
+  # Veritabanı şemasını versiyonlu biçimde uygular.
+  # golang-migrate seçildi: up/down desteği, dirty-state tespiti ve
+  # sıralı uygulama garantisi verir — düz .sql script'lerinin hiçbirinde
+  # bu güvenceler yoktur.
+  migrate:
+    image: migrate/migrate:v4.18.1
+    container_name: hub-migrate
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      - "up"
+    restart: on-failure:5
+
+  # ===========================================================================
+  # PLATFORM SERVİSLERİ
+  # ===========================================================================
+
+  admin-api:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: services/admin-api
+    image: integration-hub/admin-api:1.0.0
+    container_name: hub-admin-api
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      migrate:  { condition: service_completed_successfully }
+    environment:
+      <<: *common-env
+      # Least privilege: admin-api yalnızca kendi rolüyle bağlanır.
+      DATABASE_URL: postgres://svc_admin_api:${DB_SERVICE_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      ADMIN_API_PORT: 8080
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-168h}
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      RATE_LIMIT_ADMIN_RPS: ${RATE_LIMIT_ADMIN_RPS:-20}
+      RATE_LIMIT_ADMIN_BURST: ${RATE_LIMIT_ADMIN_BURST:-40}
+      RATE_LIMIT_FAIL_CLOSED: ${RATE_LIMIT_FAIL_CLOSED:-false}
+      ADMIN_SSE_INTERVAL: ${ADMIN_SSE_INTERVAL:-2s}
+      HEALTHCHECK_PORT: 8080
+    ports:
+      - "${ADMIN_API_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 192M }
+
+  event-ingest:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: services/event-ingest
+    image: integration-hub/event-ingest:1.0.0
+    container_name: hub-event-ingest
+    depends_on:
+      postgres:   { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate:    { condition: service_completed_successfully }
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://svc_event_ingest:${DB_SERVICE_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      INGEST_HTTP_PORT: 8081
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY}
+      HMAC_TOLERANCE: ${HMAC_TOLERANCE:-300s}
+      INGEST_MAX_BODY_BYTES: ${INGEST_MAX_BODY_BYTES:-1048576}
+      RATE_LIMIT_TOOL_RPS: ${RATE_LIMIT_TOOL_RPS:-100}
+      RATE_LIMIT_TOOL_BURST: ${RATE_LIMIT_TOOL_BURST:-200}
+      RATE_LIMIT_IP_RPS: ${RATE_LIMIT_IP_RPS:-200}
+      RATE_LIMIT_IP_BURST: ${RATE_LIMIT_IP_BURST:-400}
+      RATE_LIMIT_FAIL_CLOSED: ${RATE_LIMIT_FAIL_CLOSED:-false}
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-500ms}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+      HEALTHCHECK_PORT: 8081
+    ports:
+      - "${INGEST_HOST_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 192M }
+
+  routing-engine:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: services/routing-engine
+    image: integration-hub/routing-engine:1.0.0
+    depends_on:
+      postgres:   { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate:    { condition: service_completed_successfully }
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://svc_routing_engine:${DB_SERVICE_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      ROUTING_HTTP_PORT: 8082
+      KAFKA_GROUP_ROUTING: ${KAFKA_GROUP_ROUTING:-routing-engine}
+      ROUTING_RULE_CACHE_TTL: ${ROUTING_RULE_CACHE_TTL:-60s}
+      KAFKA_FETCH_MAX_BYTES: ${KAFKA_FETCH_MAX_BYTES:-10485760}
+      HEALTHCHECK_PORT: 8082
+    # Port yayınlanmaz: bu servis dışarıdan çağrılmaz.
+    # container_name de VERİLMEZ — sabit ad, `--scale routing-engine=2`
+    # komutunu imkânsız kılardı (NFR-2.2 yatay ölçeklenebilirlik).
+    expose: ["8082"]
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 192M }
+
+  delivery-worker:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: services/delivery-worker
+    image: integration-hub/delivery-worker:1.0.0
+    depends_on:
+      postgres:   { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate:    { condition: service_completed_successfully }
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://svc_delivery_worker:${DB_SERVICE_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DELIVERY_HTTP_PORT: 8083
+      KAFKA_GROUP_DELIVERY: ${KAFKA_GROUP_DELIVERY:-delivery-worker}
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY}
+      DELIVERY_HTTP_TIMEOUT: ${DELIVERY_HTTP_TIMEOUT:-10s}
+      DELIVERY_MAX_RETRIES: ${DELIVERY_MAX_RETRIES:-5}
+      DELIVERY_BACKOFF_BASE: ${DELIVERY_BACKOFF_BASE:-1s}
+      DELIVERY_BACKOFF_MAX: ${DELIVERY_BACKOFF_MAX:-16s}
+      DELIVERY_BACKOFF_JITTER: ${DELIVERY_BACKOFF_JITTER:-0.2}
+      DELIVERY_MAX_CONCURRENCY: ${DELIVERY_MAX_CONCURRENCY:-64}
+      DELIVERY_MAX_PER_SUBSCRIBER: ${DELIVERY_MAX_PER_SUBSCRIBER:-8}
+      BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-5}
+      BREAKER_OPEN_DURATION: ${BREAKER_OPEN_DURATION:-30s}
+      RETRY_SCHEDULER_INTERVAL: ${RETRY_SCHEDULER_INTERVAL:-1s}
+      RETRY_SCHEDULER_BATCH: ${RETRY_SCHEDULER_BATCH:-100}
+      DELIVERY_LOCK_TTL: ${DELIVERY_LOCK_TTL:-30s}
+      HEALTHCHECK_PORT: 8083
+    expose: ["8083"]
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M }
+
+  dlq-handler:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: services/dlq-handler
+    image: integration-hub/dlq-handler:1.0.0
+    container_name: hub-dlq-handler
+    depends_on:
+      postgres:   { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      migrate:    { condition: service_completed_successfully }
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://svc_dlq_handler:${DB_SERVICE_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DLQ_HTTP_PORT: 8084
+      KAFKA_GROUP_DLQ: ${KAFKA_GROUP_DLQ:-dlq-handler}
+      DLQ_RETENTION_DAYS: ${DLQ_RETENTION_DAYS:-30}
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-14}
+      ATTEMPT_RETENTION_DAYS: ${ATTEMPT_RETENTION_DAYS:-14}
+      RETENTION_JOB_INTERVAL: ${RETENTION_JOB_INTERVAL:-1h}
+      DLQ_ALERT_THRESHOLD: ${DLQ_ALERT_THRESHOLD:-10}
+      HEALTHCHECK_PORT: 8084
+    expose: ["8084"]
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 192M }
+
+  # ===========================================================================
+  # MOCK TOOL'LAR (ekosistem simülasyonu)
+  # ===========================================================================
+
+  mock-publisher:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: mock-tools/mock-publisher-1
+    image: integration-hub/mock-publisher:1.0.0
+    container_name: hub-mock-publisher
+    depends_on:
+      admin-api:    { condition: service_healthy }
+      event-ingest: { condition: service_healthy }
+    environment:
+      <<: *common-env
+      MOCK_PUBLISHER_PORT: 8090
+      ADMIN_API_URL: http://admin-api:8080
+      INGEST_URL: http://event-ingest:8081/api/v1/events
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      MOCK_PUBLISHER_CRED_PATH: /data/credentials.json
+      MOCK_PUBLISHER_AUTO_FIRE: ${MOCK_PUBLISHER_AUTO_FIRE:-false}
+      MOCK_PUBLISHER_INTERVAL: ${MOCK_PUBLISHER_INTERVAL:-5s}
+      HEALTHCHECK_PORT: 8090
+    ports:
+      - "${MOCK_PUBLISHER_HOST_PORT:-8090}:8090"
+    volumes:
+      # API anahtarı burada saklanır: container yeniden başlarken yeni anahtar
+      # üretilip DB'de çöp birikmesin.
+      - publisher-creds:/data
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+  mock-subscriber:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: mock-tools/mock-subscriber-1
+    image: integration-hub/mock-subscriber:1.0.0
+    container_name: hub-mock-subscriber
+    depends_on:
+      admin-api: { condition: service_healthy }
+    environment:
+      <<: *common-env
+      MOCK_SUBSCRIBER_PORT: 8091
+      ADMIN_API_URL: http://admin-api:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # Platformun bu servise ulaşacağı adres (compose ağı içinden).
+      MOCK_SUBSCRIBER_PUBLIC_URL: http://mock-subscriber:8091/webhook
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY}
+      HMAC_TOLERANCE: ${HMAC_TOLERANCE:-300s}
+      MOCK_SUBSCRIBER_FAIL_EVERY: ${MOCK_SUBSCRIBER_FAIL_EVERY:-0}
+      HEALTHCHECK_PORT: 8091
+    ports:
+      - "${MOCK_SUBSCRIBER_HOST_PORT:-8091}:8091"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+  webhook-sink:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        CMD_PATH: mock-tools/webhook-sink
+    image: integration-hub/webhook-sink:1.0.0
+    container_name: hub-webhook-sink
+    depends_on:
+      admin-api: { condition: service_healthy }
+    environment:
+      <<: *common-env
+      WEBHOOK_SINK_PORT: 8092
+      ADMIN_API_URL: http://admin-api:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      WEBHOOK_SINK_PUBLIC_URL: http://webhook-sink:8092/webhook
+      WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY}
+      HMAC_TOLERANCE: ${HMAC_TOLERANCE:-300s}
+      WEBHOOK_SINK_CAPACITY: ${WEBHOOK_SINK_CAPACITY:-500}
+      HEALTHCHECK_PORT: 8092
+    ports:
+      - "${WEBHOOK_SINK_HOST_PORT:-8092}:8092"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+
+  # ===========================================================================
+  # ADMIN UI
+  # ===========================================================================
+
+  admin-ui:
+    build:
+      context: ./admin-ui
+      dockerfile: Dockerfile
+    image: integration-hub/admin-ui:1.0.0
+    container_name: hub-admin-ui
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      admin-api: { condition: service_healthy }
+    ports:
+      - "${ADMIN_UI_HOST_PORT:-3000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "0.3", memory: 96M }
+
+  # ===========================================================================
+  # GÖZLEMLENEBİLİRLİK
+  # ===========================================================================
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: hub-prometheus
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d      # disk şişmesin
+      - --storage.tsdb.retention.size=2GB
+      - --web.enable-lifecycle
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: hub-loki
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    user: "0:0"   # named volume sahipliği için; Loki iç süreçleri kendi kullanıcısına düşer
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    ports:
+      - "${LOKI_HOST_PORT:-3100}:3100"
+    volumes:
+      - ./infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3100/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: hub-promtail
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      loki: { condition: service_started }
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./infra/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Container loglarını okumak için Docker soketi (salt okunur).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      resources:
+        limits: { cpus: "0.3", memory: 128M }
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: hub-grafana
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      prometheus: { condition: service_healthy }
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_LOG_LEVEL: warn
+    ports:
+      - "${GRAFANA_HOST_PORT:-3001}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: hub-node-exporter
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    # Not: kök dosya sistemi (`/:/host:ro,rslave`) BİLİNÇLİ olarak
+    # bağlanmıyor. Docker Desktop (Windows/macOS) paylaşımlı mount
+    # yayılımını (shared/slave propagation) desteklemediği için o yaklaşım
+    # "path / is mounted on / but it is not a shared or slave mount"
+    # hatasıyla başarısız olur. /proc ve /sys yeterlidir; ölçülen host,
+    # her durumda Docker'ın Linux VM'idir.
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.disable-defaults
+      - --collector.cpu
+      - --collector.meminfo
+      - --collector.loadavg
+      - --collector.netdev
+      - --collector.filesystem
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    deploy:
+      resources:
+        limits: { cpus: "0.2", memory: 64M }
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: hub-postgres-exporter
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    deploy:
+      resources:
+        limits: { cpus: "0.2", memory: 64M }
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: hub-redis-exporter
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      redis: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    deploy:
+      resources:
+        limits: { cpus: "0.2", memory: 64M }
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    container_name: hub-kafka-exporter
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      kafka: { condition: service_healthy }
+    command:
+      - --kafka.server=kafka:9092
+      - --web.listen-address=:9308
+    deploy:
+      resources:
+        limits: { cpus: "0.2", memory: 96M }
+
+  # ===========================================================================
+  # GELİŞTİRME ARAÇLARI (yalnızca dev ortamı)
+  # ===========================================================================
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: hub-kafka-ui
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: integration-hub
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "false"
+      AUTH_TYPE: DISABLED
+      JAVA_OPTS: "-Xmx384m -Xms192m"
+    ports:
+      - "${KAFKA_UI_HOST_PORT:-8085}:8080"
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  pgadmin:
+    image: dpage/pgadmin4:8.14
+    container_name: hub-pgadmin
+    restart: unless-stopped
+    networks: [hub-net]
+    logging: *default-logging
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_DISABLE_POSTFIX: "True"
+    ports:
+      - "${PGADMIN_HOST_PORT:-5050}:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    deploy:
+      resources:
+        limits: { cpus: "0.3", memory: 384M }

@@ -1,0 +1,1178 @@
+openapi: 3.1.0
+
+info:
+  title: Integration & Event Hub — Admin API
+  version: 1.0.0
+  description: |
+    MindMons Integration & Event Hub platformunun **kontrol düzlemi**.
+
+    Bu API ile ekosistem konfigürasyonu (tool, event tipi, abonelik,
+    yönlendirme kuralı, API anahtarı) yönetilir ve operasyonel veri
+    (event akışı, teslimat denemeleri, DLQ, denetim kaydı) sorgulanır.
+
+    ## Kimlik doğrulama
+    Tüm `/api/v1/*` uçları (login ve refresh hariç) `Authorization: Bearer <access_token>`
+    başlığı ister. Access token 15 dakika geçerlidir; süresi dolduğunda
+    `/api/v1/auth/refresh` ile yenilenir. Refresh token **tek kullanımlıktır**
+    (rotation): her yenilemede yeni bir refresh token döner ve eskisi iptal olur.
+
+    ## Hata biçimi
+    Tüm hatalar aynı gövdeyi kullanır:
+    ```json
+    { "error": { "code": "validation_failed", "message": "...", "details": {...}, "trace_id": "..." } }
+    ```
+
+    ## Rate limiting
+    Kimlik doğrulanmamış uçlar IP başına, doğrulanmış uçlar kullanıcı başına
+    Redis token bucket ile sınırlandırılır. Limit aşımında `429` ve
+    `Retry-After` başlığı döner.
+
+  contact:
+    name: MindMons Platform Ekibi
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: Yerel geliştirme (Docker Compose)
+  - url: /api
+    description: Admin UI nginx proxy üzerinden
+
+tags:
+  - name: Auth
+    description: Oturum yönetimi
+  - name: Tools
+    description: Ekosisteme kayıtlı tool'lar ve API anahtarları
+  - name: Event Types
+    description: Event şema kontratları
+  - name: Subscriptions
+    description: Hangi tool hangi event tipine abone
+  - name: Routing Rules
+    description: Yönlendirme filtreleri
+  - name: Operations
+    description: Event akışı, teslimat, DLQ
+  - name: Audit
+    description: Denetim kayıtları ve istatistikler
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Proses ayakta
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: admin-api }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness probe — bağımlılıkları yoklar
+      security: []
+      responses:
+        '200': { description: Trafik alabilir }
+        '503': { description: Bağımlılıklardan biri erişilemez }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus metrikleri
+      security: []
+      responses:
+        '200':
+          description: OpenMetrics formatında metrikler
+          content:
+            text/plain: {}
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Oturum aç
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: admin@mindmons.local }
+                password: { type: string, format: password, minLength: 8 }
+      responses:
+        '200':
+          description: Token çifti üretildi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Token yenile (refresh token tek kullanımlıktır)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Yeni token çifti
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Tüm refresh token'ları iptal et
+      responses:
+        '200': { description: Oturum kapatıldı }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Oturum sahibinin profili
+      responses:
+        '200':
+          description: Kullanıcı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+
+  /api/v1/auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Şifre değiştir (tüm oturumlar kapanır)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Şifre güncellendi }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/tools:
+    get:
+      tags: [Tools]
+      summary: Tool'ları listele
+      parameters:
+        - { name: kind,   in: query, schema: { type: string, enum: [publisher, subscriber, both] } }
+        - { name: status, in: query, schema: { type: string, enum: [active, suspended, disabled] } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Tool listesi
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/Tool' }
+    post:
+      tags: [Tools]
+      summary: Yeni tool kaydet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ToolRequest' }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tool' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { description: slug zaten kullanılıyor }
+
+  /api/v1/tools/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Tools]
+      summary: Tool detayı
+      responses:
+        '200':
+          description: Tool
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tool' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Tools]
+      summary: Tool güncelle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ToolRequest' }
+      responses:
+        '200':
+          description: Güncellendi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tool' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Tools]
+      summary: Tool sil (bağlı abonelikler de silinir)
+      responses:
+        '204': { description: Silindi }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tools/{id}/keys:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Tools]
+      summary: Tool'un API anahtarlarını listele (plaintext DÖNMEZ)
+      responses:
+        '200':
+          description: Anahtar üst verileri
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApiKeyInfo' }
+    post:
+      tags: [Tools]
+      summary: Yeni API anahtarı üret
+      description: |
+        `api_key` ve `hmac_secret` **yalnızca bu yanıtta** görünür.
+        Platform bunları hash'li/şifreli saklar ve bir daha gösteremez.
+      responses:
+        '201':
+          description: Anahtar üretildi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyIssued' }
+
+  /api/v1/tools/{id}/keys/rotate:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Tools]
+      summary: Anahtar rotasyonu (grace period ile)
+      description: |
+        Mevcut aktif anahtarlar `rotating` durumuna alınır ve `grace_period`
+        boyunca geçerli kalmaya devam eder; böylece tool yapılandırmasını
+        kesintisiz güncelleyebilir. Süre sonunda eski anahtar reddedilir.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_period:
+                  type: string
+                  description: Go süre biçimi (varsayılan 24h, en fazla 720h)
+                  example: 24h
+      responses:
+        '201':
+          description: Yeni anahtar üretildi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyIssued' }
+
+  /api/v1/tools/{id}/keys/{keyId}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - { name: keyId, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [Tools]
+      summary: Anahtarı anında iptal et
+      responses:
+        '204': { description: İptal edildi }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/event-types:
+    get:
+      tags: [Event Types]
+      summary: Event tiplerini listele
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Event tipleri
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/EventType' }
+    post:
+      tags: [Event Types]
+      summary: Yeni event tipi tanımla
+      description: |
+        `json_schema` derlenebilir bir JSON Schema (draft 2020-12) olmalıdır;
+        aksi halde `400` döner. Aynı `(name, version)` ikilisi ikinci kez
+        tanımlanamaz — kırıcı değişiklik için versiyon artırılır.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventTypeRequest' }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventType' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { description: Bu ad ve versiyon zaten tanımlı }
+
+  /api/v1/event-types/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Event Types]
+      summary: Event tipi detayı
+      responses:
+        '200':
+          description: Event tipi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventType' }
+    put:
+      tags: [Event Types]
+      summary: Event tipi güncelle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventTypeRequest' }
+      responses:
+        '200':
+          description: Güncellendi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventType' }
+    delete:
+      tags: [Event Types]
+      summary: Event tipi sil
+      responses:
+        '204': { description: Silindi }
+
+  /api/v1/subscriptions:
+    get:
+      tags: [Subscriptions]
+      summary: Abonelikleri listele
+      parameters:
+        - { name: tool_id,       in: query, schema: { type: string, format: uuid } }
+        - { name: event_type_id, in: query, schema: { type: string, format: uuid } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Abonelikler
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/Subscription' }
+    post:
+      tags: [Subscriptions]
+      summary: Abonelik oluştur
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionRequest' }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { description: Aynı hedef için abonelik zaten var }
+
+  /api/v1/subscriptions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Subscriptions]
+      summary: Abonelik detayı
+      responses:
+        '200':
+          description: Abonelik
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+    put:
+      tags: [Subscriptions]
+      summary: Abonelik güncelle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubscriptionRequest' }
+      responses:
+        '200':
+          description: Güncellendi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+    delete:
+      tags: [Subscriptions]
+      summary: Abonelik sil
+      responses:
+        '204': { description: Silindi }
+
+  /api/v1/routing-rules:
+    get:
+      tags: [Routing Rules]
+      summary: Yönlendirme kurallarını listele
+      parameters:
+        - { name: subscription_id, in: query, schema: { type: string, format: uuid } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Kurallar
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/RoutingRule' }
+    post:
+      tags: [Routing Rules]
+      summary: Kural oluştur
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoutingRuleRequest' }
+      responses:
+        '201':
+          description: Oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingRule' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/routing-rules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Routing Rules]
+      summary: Kural detayı
+      responses:
+        '200':
+          description: Kural
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingRule' }
+    put:
+      tags: [Routing Rules]
+      summary: Kural güncelle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoutingRuleRequest' }
+      responses:
+        '200':
+          description: Güncellendi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingRule' }
+    delete:
+      tags: [Routing Rules]
+      summary: Kural sil
+      responses:
+        '204': { description: Silindi }
+
+  /api/v1/routing-rules/test:
+    post:
+      tags: [Routing Rules]
+      summary: Kuralı örnek belge üzerinde dene
+      description: |
+        Kuralı canlıya almadan doğrulamak için kullanılır. `sample` kökünde
+        `event_type`, `source_tool`, `payload` ve `metadata` alanları beklenir.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                condition: { $ref: '#/components/schemas/Condition' }
+                sample:    { type: object, additionalProperties: true }
+            example:
+              condition:
+                op: and
+                rules:
+                  - { path: payload.status, op: eq, value: active }
+              sample:
+                event_type: user.created
+                payload: { status: active }
+      responses:
+        '200':
+          description: Değerlendirme sonucu
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matched: { type: boolean }
+
+  /api/v1/events:
+    get:
+      tags: [Operations]
+      summary: Alınan event'leri listele
+      parameters:
+        - { name: event_type,  in: query, schema: { type: string } }
+        - { name: source_tool, in: query, schema: { type: string } }
+        - { name: status,      in: query, schema: { type: string, enum: [accepted, routed, no_match, failed] } }
+        - { name: search,      in: query, schema: { type: string }, description: event_id veya trace_id içinde arama }
+        - { name: since,       in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Event listesi
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/EventInstance' }
+
+  /api/v1/events/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: event_instance id veya event_id }
+    get:
+      tags: [Operations]
+      summary: Event detayı
+      responses:
+        '200':
+          description: Event
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventInstance' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/stream/events:
+    get:
+      tags: [Operations]
+      summary: Canlı event akışı (Server-Sent Events)
+      description: |
+        `text/event-stream` döner. Olay tipleri: `ready` (bağlantı kuruldu),
+        `event` (yeni event). 20 saniyede bir yorum satırı ile heartbeat
+        gönderilir.
+      responses:
+        '200':
+          description: SSE akışı
+          content:
+            text/event-stream: {}
+
+  /api/v1/delivery-attempts:
+    get:
+      tags: [Operations]
+      summary: Teslimat denemelerini listele
+      parameters:
+        - { name: subscription_id, in: query, schema: { type: string, format: uuid } }
+        - { name: event_id,        in: query, schema: { type: string } }
+        - { name: status,          in: query, schema: { type: string, enum: [pending, in_flight, succeeded, failed, dead] } }
+        - { name: only_failed,     in: query, schema: { type: boolean } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Denemeler
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/DeliveryAttempt' }
+
+  /api/v1/dlq:
+    get:
+      tags: [Operations]
+      summary: DLQ kayıtlarını listele
+      parameters:
+        - { name: status,          in: query, schema: { type: string, enum: [new, replay_requested, replayed, discarded] } }
+        - { name: subscription_id, in: query, schema: { type: string, format: uuid } }
+        - { name: event_type,      in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: DLQ kayıtları
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/DlqEvent' }
+
+  /api/v1/dlq/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Operations]
+      summary: DLQ kaydı detayı
+      responses:
+        '200':
+          description: DLQ kaydı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DlqEvent' }
+
+  /api/v1/dlq/replay:
+    post:
+      tags: [Operations]
+      summary: DLQ kaydını / kayıtlarını yeniden gönder
+      description: |
+        `ids` verilirse seçili kayıtlar, `subscription_id` verilirse o
+        subscriber'ın bekleyen tüm kayıtları replay kuyruğuna alınır.
+
+        Admin API mesajı Kafka'ya kendisi basmaz; kaydı `replay_requested`
+        durumuna alır. Yeniden yayını `dlq-handler` yapar — bu yüzden yanıt
+        `202 Accepted`'tır.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplayRequest' }
+      responses:
+        '202':
+          description: Replay kuyruğa alındı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/dlq/discard:
+    post:
+      tags: [Operations]
+      summary: DLQ kayıtlarını kalıcı olarak yok say
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: { type: string, format: uuid }
+      responses:
+        '200':
+          description: İşaretlendi
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  discarded: { type: integer }
+
+  /api/v1/audit-logs:
+    get:
+      tags: [Audit]
+      summary: Denetim kayıtlarını listele
+      parameters:
+        - { name: action,        in: query, schema: { type: string }, example: tool.create }
+        - { name: resource_type, in: query, schema: { type: string } }
+        - { name: actor_id,      in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Denetim kayıtları
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/AuditLog' }
+
+  /api/v1/stats:
+    get:
+      tags: [Audit]
+      summary: Dashboard özet istatistikleri
+      responses:
+        '200':
+          description: İstatistikler
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardStats' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 50, minimum: 1, maximum: 500 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0, minimum: 0 }
+
+  responses:
+    Unauthorized:
+      description: Kimlik doğrulanamadı
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Kayıt bulunamadı
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: İstek doğrulanamadı
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: validation_failed
+              message: tool tanımı geçersiz
+              details:
+                slug: küçük harf, rakam ve tire; 3-64 karakter
+    RateLimited:
+      description: Hız limiti aşıldı
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Kaç saniye sonra tekrar denenmeli
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:    { type: string, example: validation_failed }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: { type: string }
+            trace_id: { type: string }
+
+    ListEnvelope:
+      type: object
+      properties:
+        items: { type: array, items: {} }
+        meta:
+          type: object
+          properties:
+            total:  { type: integer }
+            limit:  { type: integer }
+            offset: { type: integer }
+
+    AdminUser:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        email:         { type: string, format: email }
+        display_name:  { type: string }
+        role:          { type: string, enum: [admin, operator, viewer] }
+        is_active:     { type: boolean }
+        last_login_at: { type: string, format: date-time, nullable: true }
+        created_at:    { type: string, format: date-time }
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token:  { type: string }
+        refresh_token: { type: string }
+        token_type:    { type: string, example: Bearer }
+        expires_at:    { type: string, format: date-time }
+        user:          { $ref: '#/components/schemas/AdminUser' }
+
+    Tool:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        slug:          { type: string, example: mock-publisher-1 }
+        name:          { type: string }
+        description:   { type: string }
+        kind:          { type: string, enum: [publisher, subscriber, both] }
+        status:        { type: string, enum: [active, suspended, disabled] }
+        contact_email: { type: string }
+        metadata:      { type: object, additionalProperties: true }
+        created_at:    { type: string, format: date-time }
+        updated_at:    { type: string, format: date-time }
+
+    ToolRequest:
+      type: object
+      required: [slug, name, kind]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,62}[a-z0-9])$'
+          example: billing-service
+        name:          { type: string }
+        description:   { type: string }
+        kind:          { type: string, enum: [publisher, subscriber, both] }
+        status:        { type: string, enum: [active, suspended, disabled] }
+        contact_email: { type: string }
+        metadata:      { type: object, additionalProperties: true }
+
+    ApiKeyInfo:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        tool_id:      { type: string, format: uuid }
+        key_prefix:   { type: string, example: ih_a1b2c3d4e5f6 }
+        status:       { type: string, enum: [active, rotating, revoked] }
+        grace_until:  { type: string, format: date-time, nullable: true }
+        expires_at:   { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        created_at:   { type: string, format: date-time }
+
+    ApiKeyIssued:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeyInfo'
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: Tam API anahtarı — SADECE BURADA görünür
+              example: ih_a1b2c3d4e5f6_9f8e7d6c5b4a...
+            hmac_secret:
+              type: string
+              description: Event imzalamada kullanılacak secret — SADECE BURADA görünür
+            warning: { type: string }
+
+    EventType:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        owner_tool_id: { type: string, format: uuid, nullable: true }
+        name:          { type: string, example: user.created }
+        version:       { type: integer, example: 1 }
+        description:   { type: string }
+        json_schema:   { type: object, additionalProperties: true }
+        is_active:     { type: boolean }
+        created_at:    { type: string, format: date-time }
+        updated_at:    { type: string, format: date-time }
+
+    EventTypeRequest:
+      type: object
+      required: [name, json_schema]
+      properties:
+        owner_tool_id: { type: string, format: uuid, nullable: true }
+        name:
+          type: string
+          pattern: '^[a-z0-9]+(\.[a-z0-9_]+){1,4}$'
+          example: invoice.paid
+        version:     { type: integer, default: 1, minimum: 1 }
+        description: { type: string }
+        json_schema:
+          type: object
+          description: JSON Schema draft 2020-12 belgesi
+        is_active:   { type: boolean, default: true }
+
+    Subscription:
+      type: object
+      properties:
+        id:                 { type: string, format: uuid }
+        subscriber_tool_id: { type: string, format: uuid }
+        subscriber_slug:    { type: string }
+        event_type_id:      { type: string, format: uuid }
+        event_type_name:    { type: string }
+        event_type_version: { type: integer }
+        endpoint_url:       { type: string, format: uri }
+        http_headers:       { type: object, additionalProperties: { type: string } }
+        max_retries:        { type: integer }
+        timeout_ms:         { type: integer }
+        is_active:          { type: boolean }
+        created_at:         { type: string, format: date-time }
+        updated_at:         { type: string, format: date-time }
+
+    SubscriptionRequest:
+      type: object
+      required: [subscriber_tool_id, event_type_id, endpoint_url]
+      properties:
+        subscriber_tool_id: { type: string, format: uuid }
+        event_type_id:      { type: string, format: uuid }
+        endpoint_url:       { type: string, format: uri, example: 'http://mock-subscriber:8091/webhook' }
+        http_headers:       { type: object, additionalProperties: { type: string } }
+        max_retries:        { type: integer, default: 5, minimum: 0, maximum: 20 }
+        timeout_ms:         { type: integer, default: 10000, minimum: 100, maximum: 120000 }
+        is_active:          { type: boolean, default: true }
+
+    Condition:
+      type: object
+      description: |
+        Yönlendirme koşulu ağacı. Boş obje `{}` "koşulsuz eşleş" demektir.
+
+        Operatörler: `and`, `or`, `not` (birleştirici) ve
+        `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `contains`,
+        `exists`, `regex` (karşılaştırma).
+
+        `path` noktalı yoldur ve dizi indeksi destekler:
+        `payload.items.0.sku`
+      properties:
+        op:    { type: string, enum: [and, or, not, eq, neq, gt, gte, lt, lte, in, nin, contains, exists, regex] }
+        path:  { type: string, example: payload.status }
+        value: {}
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/Condition' }
+
+    RoutingRule:
+      type: object
+      properties:
+        id:              { type: string, format: uuid }
+        name:            { type: string }
+        subscription_id: { type: string, format: uuid }
+        condition:       { $ref: '#/components/schemas/Condition' }
+        priority:        { type: integer }
+        is_active:       { type: boolean }
+        event_type_name: { type: string }
+        endpoint_url:    { type: string }
+        created_at:      { type: string, format: date-time }
+        updated_at:      { type: string, format: date-time }
+
+    RoutingRuleRequest:
+      type: object
+      required: [name, subscription_id]
+      properties:
+        name:            { type: string }
+        subscription_id: { type: string, format: uuid }
+        condition:       { $ref: '#/components/schemas/Condition' }
+        priority:        { type: integer, default: 100 }
+        is_active:       { type: boolean, default: true }
+
+    EventInstance:
+      type: object
+      properties:
+        id:            { type: string, format: uuid }
+        event_id:      { type: string }
+        event_type:    { type: string }
+        event_version: { type: integer }
+        source_tool:   { type: string }
+        payload:       { type: object, additionalProperties: true }
+        metadata:      { type: object, additionalProperties: true }
+        trace_id:      { type: string }
+        status:        { type: string, enum: [accepted, routed, no_match, failed] }
+        received_at:   { type: string, format: date-time }
+        routed_at:     { type: string, format: date-time, nullable: true }
+
+    DeliveryAttempt:
+      type: object
+      properties:
+        id:               { type: integer, format: int64 }
+        delivery_task_id: { type: string, format: uuid }
+        event_id:         { type: string }
+        event_type:       { type: string }
+        subscriber_slug:  { type: string }
+        target_url:       { type: string }
+        attempt_no:       { type: integer }
+        response_status:  { type: integer, nullable: true }
+        response_body:    { type: string }
+        latency_ms:       { type: integer }
+        error:            { type: string }
+        attempted_at:     { type: string, format: date-time }
+        task_status:      { type: string }
+        next_attempt_at:  { type: string, format: date-time, nullable: true }
+
+    DlqEvent:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        delivery_task_id: { type: string, format: uuid, nullable: true }
+        subscription_id:  { type: string, format: uuid, nullable: true }
+        subscriber_slug:  { type: string }
+        event_id:         { type: string }
+        event_type:       { type: string }
+        target_url:       { type: string }
+        reason:           { type: string }
+        attempts:         { type: integer }
+        payload:          { type: object, additionalProperties: true }
+        status:           { type: string, enum: [new, replay_requested, replayed, discarded] }
+        created_at:       { type: string, format: date-time }
+        replayed_at:      { type: string, format: date-time, nullable: true }
+
+    ReplayRequest:
+      type: object
+      properties:
+        ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Tekil/çoklu replay için DLQ kayıt id'leri
+        subscription_id:
+          type: string
+          format: uuid
+          description: Verilirse bu subscriber'ın bekleyen tüm kayıtları replay edilir
+        limit:
+          type: integer
+          default: 500
+          description: Toplu replay üst sınırı
+
+    ReplayResponse:
+      type: object
+      properties:
+        requested: { type: integer }
+        replayed:  { type: integer }
+        skipped:   { type: integer }
+        errors:
+          type: array
+          items: { type: string }
+
+    AuditLog:
+      type: object
+      properties:
+        id:            { type: integer, format: int64 }
+        actor_type:    { type: string, enum: [admin, tool, system] }
+        actor_id:      { type: string }
+        actor_label:   { type: string }
+        action:        { type: string, example: api_key.rotate }
+        resource_type: { type: string }
+        resource_id:   { type: string }
+        before_state:  { type: object, additionalProperties: true, nullable: true }
+        after_state:   { type: object, additionalProperties: true, nullable: true }
+        ip:            { type: string }
+        user_agent:    { type: string }
+        trace_id:      { type: string }
+        created_at:    { type: string, format: date-time }
+
+    DashboardStats:
+      type: object
+      properties:
+        tools:
+          type: object
+          properties:
+            total:  { type: integer }
+            active: { type: integer }
+        subscriptions:
+          type: object
+          properties:
+            total:  { type: integer }
+            active: { type: integer }
+        events:
+          type: object
+          properties:
+            last_24h:   { type: integer }
+            last_hour:  { type: integer }
+            total:      { type: integer }
+        deliveries:
+          type: object
+          properties:
+            succeeded_24h: { type: integer }
+            failed_24h:    { type: integer }
+            pending:       { type: integer }
+            success_rate:  { type: number, format: double }
+        dlq:
+          type: object
+          properties:
+            pending:  { type: integer }
+            total:    { type: integer }
+            replayed: { type: integer }
+        outbox:
+          type: object
+          properties:
+            pending: { type: integer }
+        events_per_type:
+          type: array
+          items:
+            type: object
+            properties:
+              name:  { type: string }
+              count: { type: integer }
+        events_timeline:
+          type: array
+          items:
+            type: object
+            properties:
+              bucket: { type: string, format: date-time }
+              count:  { type: integer }
+        top_subscribers:
+          type: array
+          items:
+            type: object
+            properties:
+              name:  { type: string }
+              count: { type: integer }
+        generated_at: { type: string, format: date-time }

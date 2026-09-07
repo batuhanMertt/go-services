@@ -1,0 +1,153 @@
+erDiagram
+    TOOLS ||--o{ API_KEYS : "sahip olur"
+    TOOLS ||--o{ EVENT_TYPES : "yayınlar"
+    TOOLS ||--o{ SUBSCRIPTIONS : "abone olur"
+    TOOLS ||--o{ EVENT_INSTANCES : "üretir"
+
+    EVENT_TYPES ||--o{ SUBSCRIPTIONS : "hedeflenir"
+    SUBSCRIPTIONS ||--o{ ROUTING_RULES : "filtrelenir"
+    SUBSCRIPTIONS ||--o{ DELIVERY_TASKS : "teslim alır"
+
+    EVENT_INSTANCES ||--o{ DELIVERY_TASKS : "üretir"
+    DELIVERY_TASKS ||--o{ DELIVERY_ATTEMPTS : "denenir"
+    DELIVERY_TASKS ||--o| DLQ_EVENTS : "karantinaya alınır"
+    EVENT_INSTANCES ||--o{ DLQ_EVENTS : "referans"
+
+    ADMIN_USERS ||--o{ REFRESH_TOKENS : "oturum açar"
+    ADMIN_USERS ||--o{ AUDIT_LOGS : "işlem yapar"
+
+    TOOLS {
+        uuid id PK
+        text slug UK "makine-dostu kimlik"
+        text name
+        text kind "publisher|subscriber|both"
+        text status "active|suspended|disabled"
+        jsonb metadata
+        timestamptz created_at
+    }
+
+    API_KEYS {
+        uuid id PK
+        uuid tool_id FK
+        text key_prefix UK "ih_<12hex> - duz metin lookup"
+        bytea key_hash "sha256(tam anahtar)"
+        bytea hmac_secret_enc "AES-256-GCM sifreli"
+        text status "active|rotating|revoked"
+        timestamptz grace_until "rotasyon gecis suresi"
+        timestamptz last_used_at
+    }
+
+    EVENT_TYPES {
+        uuid id PK
+        uuid owner_tool_id FK
+        text name "user.created"
+        int version "additive-only evrim"
+        jsonb json_schema "draft 2020-12"
+        bool is_active
+    }
+
+    SUBSCRIPTIONS {
+        uuid id PK
+        uuid subscriber_tool_id FK
+        uuid event_type_id FK
+        text endpoint_url
+        jsonb http_headers
+        int max_retries
+        int timeout_ms
+        bool is_active
+    }
+
+    ROUTING_RULES {
+        uuid id PK
+        uuid subscription_id FK
+        text name
+        jsonb condition "kosul agaci DSL"
+        int priority
+        bool is_active
+    }
+
+    EVENT_INSTANCES {
+        uuid id PK
+        text event_id UK "idempotency anahtari"
+        text event_type
+        int event_version
+        uuid source_tool_id FK
+        jsonb payload
+        jsonb metadata
+        text trace_id
+        text status "accepted|routed|no_match|failed"
+        jsonb response_snapshot "idempotent replay yaniti"
+        timestamptz received_at
+    }
+
+    OUTBOX_MESSAGES {
+        bigserial id PK
+        text topic
+        text partition_key
+        jsonb payload
+        int attempts
+        timestamptz published_at "NULL = bekliyor"
+    }
+
+    DELIVERY_TASKS {
+        uuid id PK
+        uuid event_instance_id FK
+        uuid subscription_id FK
+        text target_url
+        text status "pending|in_flight|succeeded|failed|dead"
+        int attempt_count
+        int max_retries
+        timestamptz next_attempt_at "gecikmeli kuyruk anahtari"
+        text last_error
+    }
+
+    DELIVERY_ATTEMPTS {
+        bigserial id PK
+        uuid delivery_task_id FK
+        int attempt_no
+        int response_status
+        text response_body "ilk 512 byte"
+        int latency_ms
+        text error
+        timestamptz attempted_at
+    }
+
+    DLQ_EVENTS {
+        uuid id PK
+        uuid delivery_task_id FK "UNIQUE - gorev basina tek kayit"
+        uuid event_instance_id FK
+        uuid subscription_id FK
+        text reason
+        int attempts
+        jsonb payload
+        text status "new|replay_requested|replayed|discarded"
+        int replay_count
+    }
+
+    AUDIT_LOGS {
+        bigserial id PK
+        text actor_type "admin|tool|system"
+        text actor_id
+        text action "tool.create, api_key.rotate..."
+        text resource_type
+        jsonb before_state
+        jsonb after_state
+        text trace_id
+        timestamptz created_at
+    }
+
+    ADMIN_USERS {
+        uuid id PK
+        text email UK
+        text password_hash "argon2id PHC"
+        text role "admin|operator|viewer"
+        bool is_active
+    }
+
+    REFRESH_TOKENS {
+        uuid id PK
+        uuid user_id FK
+        bytea token_hash UK "sha256, tek kullanimlik"
+        timestamptz expires_at
+        timestamptz revoked_at
+    }

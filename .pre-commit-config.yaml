@@ -1,0 +1,82 @@
+# =============================================================================
+# Pre-commit hook'ları — CI'ın yakalayacağı hataları commit öncesi yakalar.
+#
+# Kurulum:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Elle çalıştırma:
+#   pre-commit run --all-files
+# =============================================================================
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        # docker-compose.yml YAML anchor'ları içerir; check-yaml bunları anlar.
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]   # shell script'ler Linux container'da çalışıyor
+
+  # --- Go ---------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: gofmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+        pass_filenames: true
+
+      - id: go-vet
+        name: go vet
+        entry: bash -c 'go vet ./internal/... ./services/... ./mock-tools/... ./tools/...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-test-fast
+        name: go test (kısa)
+        entry: bash -c 'go test -short ./internal/...'
+        language: system
+        types: [go]
+        pass_filenames: false
+
+  # --- Secret sızıntısı --------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: no-env-file
+        name: .env commit edilmesin
+        entry: bash -c 'if git diff --cached --name-only | grep -qE "^\.env$"; then echo "HATA: .env commit edilemez"; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+      - id: no-changeme-secrets
+        name: CHANGE_ME dışında gerçek secret var mı?
+        entry: bash -c 'if git diff --cached --name-only | grep -q "\.env\.example$"; then grep -nE "^(POSTGRES_PASSWORD|JWT_SECRET|REDIS_PASSWORD|WEBHOOK_SIGNING_KEY|ADMIN_PASSWORD)=" .env.example | grep -qv "CHANGE_ME" && { echo "HATA: .env.example gerçek secret içeriyor"; exit 1; } || true; fi'
+        language: system
+        pass_filenames: false
+
+  # --- Frontend ----------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: ui-lint
+        name: admin-ui eslint
+        entry: bash -c 'cd admin-ui && npm run lint'
+        language: system
+        files: ^admin-ui/src/.*\.(ts|tsx)$
+        pass_filenames: false
+
+  # --- Shell -------------------------------------------------------------------
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=warning]

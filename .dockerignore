@@ -1,0 +1,29 @@
+# Build context'i küçük tutar: her `docker build` bu dizini daemon'a gönderir.
+.git
+.github
+.env
+.env.*
+!.env.example
+
+# Frontend build artefaktları (admin-ui kendi Dockerfile'ında npm ci yapar)
+admin-ui/node_modules
+admin-ui/dist
+node_modules
+
+# Docker/veri
+.docker-data
+docs/diagrams/*.excalidraw
+
+# Derleme çıktıları
+bin
+dist
+*.exe
+coverage.out
+coverage.html
+
+# Editör
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db

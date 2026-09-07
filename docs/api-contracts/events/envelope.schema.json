@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindmons.local/schemas/envelope.schema.json",
+  "title": "Integration Hub Event Envelope v1",
+  "description": "Platformdaki TÜM event'lerin paylaştığı ortak zarf. Altyapı servisleri (routing, delivery, dlq) yalnızca bu alanlara bakar; payload domain'e aittir. Bu ayrım sayesinde yeni bir event tipi eklemek hiçbir servisin kodunu değiştirmez.",
+  "type": "object",
+  "required": ["event_id", "event_type", "source_tool", "timestamp", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$",
+      "description": "Publisher tarafından üretilen benzersiz kimlik. Idempotency anahtarıdır — aynı değerle gelen ikinci istek yeni kayıt oluşturmaz. UUID v4 önerilir.",
+      "examples": ["3f9a1c72-5b0e-4a1d-9f6c-7c2e8d5b1a34"]
+    },
+    "event_type": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9_]+){1,4}$",
+      "description": "Noktalı ad. Sol taraf domain, sağ taraf geçmiş zamanlı eylemdir: 'user.created', 'invoice.paid'.",
+      "examples": ["user.created", "document.generated"]
+    },
+    "event_version": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Şema versiyonu. Kırıcı bir değişiklik gerektiğinde artırılır; eski versiyon çalışmaya devam eder."
+    },
+    "source_tool": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Yayınlayan tool'un slug'ı. Platform bunun API anahtarının sahibiyle eşleştiğini doğrular (kimlik sahteciliği koruması)."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Olayın KAYNAK SİSTEMDE gerçekleştiği an. Platformun event'i aldığı an ayrıca kaydedilir (received_at); ikisi arasındaki fark publisher gecikmesidir."
+    },
+    "trace_id": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Uçtan uca izleme kimliği. Verilmezse platform üretir. Loki'de bu değerle publisher'dan subscriber'a tüm yolculuk aranabilir."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Event tipine özgü gövde. İlgili event tipi şemasına göre doğrulanır."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Opsiyonel serbest alan: korelasyon kimlikleri, tenant bilgisi, kaynak sürümü vb. Yönlendirme kurallarında 'metadata.<alan>' yoluyla kullanılabilir."
+    }
+  }
+}

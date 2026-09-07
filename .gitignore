@@ -1,0 +1,35 @@
+# Secrets — asla commit edilmez
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Build çıktıları
+bin/
+dist/
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# Node / frontend
+node_modules/
+admin-ui/dist/
+admin-ui/.vite/
+npm-debug.log*
+
+# Docker / runtime volume artefaktları
+.docker-data/
+
+# Editör
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Geçici
+tmp/
+*.log

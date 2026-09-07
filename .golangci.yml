@@ -1,0 +1,112 @@
+# =============================================================================
+# golangci-lint yapılandırması
+#
+# Prensip: gürültü değil, sinyal. Etkinleştirilen her linter gerçek bir hata
+# sınıfını yakalar. "Stil polisi" linter'lar (lll, gochecknoglobals, wsl)
+# bilinçli olarak kapalı — gofmt zaten biçimi belirliyor.
+# =============================================================================
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    # --- Doğruluk ------------------------------------------------------------
+    - errcheck      # kontrol edilmeyen hata dönüşleri
+    - govet         # shadow, printf, atomic, copylocks
+    - staticcheck   # kapsamlı statik analiz
+    - ineffassign   # kullanılmayan atamalar
+    - typecheck     # derleme hataları
+    - bodyclose     # kapatılmayan HTTP response body → dosya tanıtıcı sızıntısı
+    - rowserrcheck  # sql.Rows.Err() kontrolü — sessiz veri kaybını önler
+    - sqlclosecheck # kapatılmayan sql.Rows
+    - nilerr        # "err != nil" içinde nil dönme hatası
+
+    # --- Güvenlik ------------------------------------------------------------
+    - gosec         # zayıf kripto, komut enjeksiyonu, dosya izinleri
+
+    # --- Sadelik ve okunabilirlik --------------------------------------------
+    - unused        # ölü kod
+    - gosimple      # gereksiz karmaşıklık
+    - unconvert     # gereksiz tip dönüşümü
+    - goimports     # import düzeni
+
+    # --- Kaynak yönetimi ------------------------------------------------------
+    - noctx         # context'siz HTTP isteği → timeout'suz istek riski
+    - errorlint     # hatalı errors.Is/As kullanımı
+
+# --- Bilinçli olarak DEVRE DIŞI bırakılanlar --------------------------------
+#
+# misspell      : Kod yorumları Türkçedir. Linter yalnızca İngilizce sözlük
+#                 kullandığı için "performans" → "performances", "adres" →
+#                 "address" gibi yüzlerce yanlış pozitif üretiyor. Gerçek
+#                 yazım hatalarını bunların arasında görmek imkânsız hâle
+#                 geliyor; sinyal/gürültü oranı kabul edilemez.
+#
+# contextcheck  : Bu kod tabanında BİLİNÇLİ olarak parent'tan türetilmeyen
+#                 dört context var ve hepsi doğru:
+#                   1-2) graceful shutdown — parent zaten iptal edilmiş
+#                        durumda; ondan türetmek kapanışı anında iptal eder.
+#                   3)   panic recovery — iptal edilmiş context'te bile
+#                        yanıt yazılabilmeli.
+#                   4)   touchKeyOccasionally — yanıt döndükten sonra devam
+#                        eden fire-and-forget güncelleme.
+#                 Linter bunları çağrı noktasında raporladığı için nolint
+#                 yorumu tanımıyor. Her biri kodda ayrıca açıklanmıştır.
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: false
+    exclude-functions:
+      # Bunlar bilinçli olarak yok sayılıyor; hata yönetimi anlamsız.
+      - (net/http.ResponseWriter).Write
+      - (io.Closer).Close
+
+  govet:
+    # `shadow` BİLİNÇLİ olarak kapalı. Go'nun en yaygın deyimi olan
+    #   if err := f(); err != nil { ... }
+    # dış kapsamda bir `err` varsa her seferinde uyarı üretir. Bu, gerçek
+    # gölgeleme hatalarını yüzlerce yanlış pozitif arasında kaybettirir.
+    # Gerçek gölgeleme riski olan yerler (uzun fonksiyonlarda yeniden
+    # kullanılan değişkenler) kod incelemesinde yakalanır.
+    enable-all: false
+    disable:
+      - fieldalignment  # bellek hizalaması bu ölçekte mikro-optimizasyon
+
+  gosec:
+    excludes:
+      - G404 # math/rand: jitter ve örnekleme için kriptografik güvenlik gerekmiyor
+      - G107 # değişken URL ile HTTP isteği: webhook teslimatının doğası bu
+      - G101 # HTTP başlık ADLARINI ("X-Api-Key") gömülü secret sanıyor
+
+  staticcheck:
+    checks: ['all']
+
+
+  goimports:
+    local-prefixes: github.com/mindmons/integration-hub
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: false
+
+  # node_modules içindeki üçüncü taraf Go dosyaları taranmasın.
+  exclude-dirs:
+    - admin-ui/node_modules
+    - admin-ui/dist
+
+  exclude-rules:
+    # Testlerde hata kontrolü ve güvenlik kuralları gevşetilir.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - bodyclose
+        - noctx
+
+    # main.go'da os.Exit sonrası defer uyarısı beklenen davranış.
+    - path: main\.go
+      text: 'using os.Exit'

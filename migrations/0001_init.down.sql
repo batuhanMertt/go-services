@@ -1,0 +1,14 @@
+DROP TABLE IF EXISTS hub.audit_logs;
+DROP TABLE IF EXISTS hub.dlq_events;
+DROP TABLE IF EXISTS hub.delivery_attempts;
+DROP TABLE IF EXISTS hub.delivery_tasks;
+DROP TABLE IF EXISTS hub.outbox_messages;
+DROP TABLE IF EXISTS hub.event_instances;
+DROP TABLE IF EXISTS hub.routing_rules;
+DROP TABLE IF EXISTS hub.subscriptions;
+DROP TABLE IF EXISTS hub.event_types;
+DROP TABLE IF EXISTS hub.api_keys;
+DROP TABLE IF EXISTS hub.tools;
+DROP TABLE IF EXISTS hub.refresh_tokens;
+DROP TABLE IF EXISTS hub.admin_users;
+DROP SCHEMA IF EXISTS hub;

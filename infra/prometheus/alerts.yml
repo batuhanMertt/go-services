@@ -1,0 +1,71 @@
+# =============================================================================
+# Alert kuralları (Adım 12).
+# Tasarım prensibi — "alert fatigue" önleme: her alert eyleme dönüştürülebilir
+# olmalı ve `for` süresiyle anlık dalgalanmalarda susmalı.
+# =============================================================================
+groups:
+  - name: platform-availability
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"hub-services|mock-tools"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} kapalı"
+          description: "{{ $labels.service }} 1 dakikadır scrape edilemiyor. Runbook: docs/10-runbook.md#servis-down"
+
+      - alert: HighErrorRate
+        expr: |
+          sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+            /
+          clamp_min(sum by (service) (rate(http_requests_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} 5xx oranı %5 üzerinde"
+          description: "Son 5 dakikada isteklerin %5'inden fazlası 5xx döndü."
+
+  - name: event-pipeline
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.consumergroup }} consumer lag yüksek ({{ $value }})"
+          description: "{{ $labels.topic }} üzerinde 5 dakikadır 1000+ mesaj birikmiş. Consumer instance sayısını artırmayı değerlendirin."
+
+      - alert: DlqBacklogGrowing
+        expr: hub_dlq_pending_events > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DLQ'da {{ $value }} işlenmemiş mesaj var"
+          description: "Teslim edilemeyen mesajlar birikiyor. Admin panelinden DLQ sayfasını inceleyip replay edin."
+
+      - alert: DeliverySuccessRateLow
+        expr: |
+          sum(rate(hub_delivery_attempts_total{outcome="success"}[10m]))
+            /
+          clamp_min(sum(rate(hub_delivery_attempts_total[10m])), 0.001)
+            < 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook teslimat başarı oranı %90'ın altında"
+          description: "Subscriber'lardan biri sürekli hata dönüyor olabilir; circuit breaker durumunu kontrol edin."
+
+      - alert: OutboxBacklog
+        expr: hub_outbox_pending_messages > 500
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox'ta {{ $value }} yayınlanmamış mesaj birikti"
+          description: "Kafka'ya publish edilemiyor olabilir. Broker sağlığını kontrol edin."

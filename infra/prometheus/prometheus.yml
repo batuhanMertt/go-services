@@ -1,0 +1,62 @@
+# =============================================================================
+# Prometheus scrape yapılandırması
+# Pull modeli: her Go servisi /metrics endpoint'ini expose eder, Prometheus
+# düzenli aralıkla toplar. Servisler Prometheus'u tanımaz (gevşek bağlılık).
+# =============================================================================
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: integration-hub
+    env: dev
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # --- Platform Go servisleri ------------------------------------------------
+  - job_name: hub-services
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['admin-api:8080']
+        labels: { service: admin-api,      tier: control-plane }
+      - targets: ['event-ingest:8081']
+        labels: { service: event-ingest,   tier: data-plane }
+      - targets: ['routing-engine:8082']
+        labels: { service: routing-engine, tier: data-plane }
+      - targets: ['delivery-worker:8083']
+        labels: { service: delivery-worker, tier: data-plane }
+      - targets: ['dlq-handler:8084']
+        labels: { service: dlq-handler,    tier: data-plane }
+
+  # --- Mock tool'lar (ekosistem simülasyonu) ---------------------------------
+  - job_name: mock-tools
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['mock-publisher:8090']
+        labels: { service: mock-publisher,  tier: mock }
+      - targets: ['mock-subscriber:8091']
+        labels: { service: mock-subscriber, tier: mock }
+      - targets: ['webhook-sink:8092']
+        labels: { service: webhook-sink,    tier: mock }
+
+  # --- Altyapı exporter'ları --------------------------------------------------
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: redis-exporter
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ['kafka-exporter:9308']

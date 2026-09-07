@@ -1,0 +1,282 @@
+openapi: 3.1.0
+
+info:
+  title: Integration & Event Hub — Event Ingest API
+  version: 1.0.0
+  description: |
+    Publisher tool'ların platforma event fırlattığı **veri düzlemi girişi**.
+
+    ## Kimlik doğrulama — iki katman
+    Her istek İKİ ayrı doğrulamadan geçer:
+
+    1. **`X-Api-Key`** — "sen kimsin?" Anahtar `ih_<prefix>_<secret>` biçimindedir.
+       Platform yalnızca `prefix` ile hash'i saklar; anahtarın kendisi DB'de yoktur.
+    2. **`X-Signature-SHA256` + `X-Timestamp`** — "bu gövdeyi gerçekten sen mi
+       yolladın ve az önce mi yolladın?" İmza:
+
+       ```
+       HMAC-SHA256(hmac_secret, "<X-Timestamp>.<ham gövde>")
+       ```
+
+       hex olarak kodlanır. Zaman damgası imzanın parçasıdır; bu yüzden yakalanan
+       bir istek tolerans penceresi (varsayılan 5 dk) dışında yeniden oynatılamaz.
+
+    Neden ikisi birden? API key tek başına kullanılsaydı, anahtarı ele geçiren
+    biri gövdeyi istediği gibi değiştirebilirdi. İmza tek başına kullanılsaydı,
+    doğru satırı bulmak için tüm anahtarlar denenmek zorunda kalırdı.
+
+    ## Idempotency
+    `event_id` istemci tarafından üretilir (UUID v4 önerilir) ve platformda
+    benzersizdir. Aynı `event_id` ile gelen ikinci istek:
+    - veritabanına ikinci kez yazılmaz,
+    - Kafka'ya ikinci kez basılmaz,
+    - ilk isteğin yanıtının aynısını `X-Idempotent-Replay: true` başlığıyla döner.
+
+    Bu sayede publisher, ağ hatası sonrası isteği güvenle tekrarlayabilir.
+
+    ## Rate limiting
+    Hem IP hem tool bazında Redis token bucket uygulanır. Limit aşımında `429`
+    ve `Retry-After` döner.
+
+servers:
+  - url: http://localhost:8081
+    description: Yerel geliştirme (Docker Compose)
+
+tags:
+  - name: Ingestion
+  - name: Discovery
+  - name: Operations
+
+paths:
+  /api/v1/events:
+    post:
+      tags: [Ingestion]
+      summary: Event gönder
+      description: |
+        Doğrulanan event `event_instances` tablosuna ve outbox'a AYNI
+        transaction içinde yazılır, ardından `202 Accepted` döner. Kafka'ya
+        aktarım asenkrondur — Kafka geçici olarak erişilemez olsa bile event
+        kaybolmaz (Transactional Outbox).
+      parameters:
+        - name: X-Api-Key
+          in: header
+          required: true
+          schema: { type: string, example: ih_a1b2c3d4e5f6_9f8e7d6c5b4a3210... }
+          description: Tool'un API anahtarı
+        - name: X-Timestamp
+          in: header
+          required: true
+          schema: { type: string, example: '1735689600' }
+          description: Unix saniye veya RFC3339. Tolerans penceresi dışındaysa 401.
+        - name: X-Signature-SHA256
+          in: header
+          required: true
+          schema: { type: string }
+          description: 'hex(HMAC-SHA256(hmac_secret, "<X-Timestamp>.<gövde>"))'
+        - name: X-Trace-Id
+          in: header
+          required: false
+          schema: { type: string }
+          description: Verilirse uçtan uca izlemede kullanılır; verilmezse platform üretir.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventEnvelope' }
+            examples:
+              userCreated:
+                summary: user.created
+                value:
+                  event_id: 3f9a1c72-5b0e-4a1d-9f6c-7c2e8d5b1a34
+                  event_type: user.created
+                  event_version: 1
+                  source_tool: mock-publisher-1
+                  timestamp: '2026-08-31T10:15:00Z'
+                  trace_id: 8c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f
+                  payload:
+                    user_id: usr_9a8b7c6d
+                    email: ada@mindmons.local
+                    full_name: Ada Lovelace
+                    status: active
+                    tenant_id: tenant-a
+                    created_at: '2026-08-31T10:14:58Z'
+                  metadata:
+                    emitted_by: mock-publisher-1
+      responses:
+        '202':
+          description: Event kabul edildi
+          headers:
+            X-Idempotent-Replay:
+              schema: { type: string, enum: ['true'] }
+              description: Yalnızca mükerrer isteklerde bulunur
+            X-Trace-Id:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestResponse' }
+        '400':
+          description: Zarf veya payload şemaya uymuyor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                schemaFailed:
+                  value:
+                    error:
+                      code: schema_validation_failed
+                      message: payload event şemasına uymuyor
+                      details:
+                        status: value must be one of "active", "pending", "suspended"
+                unknownType:
+                  value:
+                    error:
+                      code: unknown_event_type
+                      message: '"invoice.paid@1" tipi tanımlı değil — admin panelinden event tipi oluşturun'
+        '401':
+          description: API key veya imza geçersiz
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                badSignature:
+                  value:
+                    error: { code: invalid_signature, message: imza doğrulanamadı }
+                staleTimestamp:
+                  value:
+                    error: { code: stale_timestamp, message: zaman damgası geçersiz veya tolerans penceresi dışında }
+        '403':
+          description: Tool aktif değil veya publisher yetkisi yok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                sourceMismatch:
+                  value:
+                    error:
+                      code: source_tool_mismatch
+                      message: source_tool ("other-tool") kimliği doğrulanan tool ile ("mock-publisher-1") eşleşmiyor
+        '413':
+          description: Gövde boyut sınırını aşıyor (varsayılan 1 MiB)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Hız limiti aşıldı
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/event-types:
+    get:
+      tags: [Discovery]
+      summary: Kabul edilen event tiplerini listele
+      description: |
+        Publisher'ların hangi `event_type@version` değerlerini gönderebileceğini
+        keşfetmesi için. Şemalar admin panelinden değiştiğinde bu liste
+        otomatik güncellenir.
+      responses:
+        '200':
+          description: Yüklü şemalar
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_types:
+                    type: array
+                    items: { type: string, example: user.created@1 }
+                  count: { type: integer }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      responses:
+        '200': { description: Proses ayakta }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness probe
+      responses:
+        '200': { description: Trafik alabilir }
+        '503': { description: Bağımlılıklardan biri erişilemez }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus metrikleri
+      responses:
+        '200':
+          description: OpenMetrics
+          content:
+            text/plain: {}
+
+components:
+  schemas:
+    EventEnvelope:
+      type: object
+      required: [event_id, event_type, source_tool, timestamp, payload]
+      description: |
+        Ortak zarf. Platform yalnızca bu alanlara bakar; `payload` içeriği
+        event tipine özgüdür ve JSON Schema ile doğrulanır.
+      properties:
+        event_id:
+          type: string
+          pattern: '^[A-Za-z0-9._:-]{8,128}$'
+          description: İstemci tarafından üretilen benzersiz kimlik (UUID v4 önerilir). Idempotency anahtarıdır.
+        event_type:
+          type: string
+          pattern: '^[a-z0-9]+(\.[a-z0-9_]+){1,4}$'
+          example: user.created
+        event_version:
+          type: integer
+          default: 1
+          minimum: 1
+          description: Şema versiyonu. Verilmezse 1 kabul edilir.
+        source_tool:
+          type: string
+          description: Yayınlayan tool'un slug'ı. API anahtarının sahibiyle EŞLEŞMELİDİR.
+          example: mock-publisher-1
+        timestamp:
+          type: string
+          format: date-time
+          description: Olayın kaynak sistemde gerçekleştiği an (RFC3339).
+        trace_id:
+          type: string
+          description: Uçtan uca izleme kimliği. Verilmezse platform üretir.
+        payload:
+          type: object
+          additionalProperties: true
+          description: Event tipine özgü gövde; ilgili JSON Schema ile doğrulanır.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Opsiyonel serbest alan (korelasyon id'leri, tenant bilgisi vb.).
+
+    IngestResponse:
+      type: object
+      properties:
+        event_id:          { type: string }
+        event_instance_id: { type: string, format: uuid }
+        status:            { type: string, example: accepted }
+        trace_id:          { type: string }
+        received_at:       { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:    { type: string }
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: { type: string }
+            trace_id: { type: string }

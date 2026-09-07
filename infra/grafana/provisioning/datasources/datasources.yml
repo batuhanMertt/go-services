@@ -1,0 +1,28 @@
+# Grafana veri kaynakları — provisioning ile kod olarak tanımlanır,
+# UI'dan elle eklemeye gerek yoktur (reproducibility).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki
+    url: http://loki:3100
+    jsonData:
+      maxLines: 1000
+      # Log satırındaki trace_id'yi tıklanabilir hale getirir.
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":"([a-zA-Z0-9-]+)"'
+          url: '$${__value.raw}'
+          datasourceUid: loki

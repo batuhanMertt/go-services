@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindmons.local/schemas/user.created@1.json",
+  "title": "user.created v1",
+  "description": "Kullanıcı yönetimi tool'u yeni bir kullanıcı oluşturduğunda yayınlanır. Bu şema `payload` alanının içeriğini tanımlar; zarf alanları envelope.schema.json'dadır.",
+  "type": "object",
+  "required": ["user_id", "email", "status"],
+  "additionalProperties": true,
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Kaynak sistemdeki kullanıcı kimliği."
+    },
+    "email": {
+      "type": "string",
+      "format": "email"
+    },
+    "full_name": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "pending", "suspended"],
+      "description": "Yönlendirme kurallarında en sık filtrelenen alan: örn. yalnızca 'active' kullanıcılar için CRM'e webhook gönder."
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Çok kiracılı kurulumlarda izolasyon anahtarı."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

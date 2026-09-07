@@ -1,0 +1,181 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   Tema değişkenleri
+   Renkler `R G B` biçiminde tutulur; Tailwind bunları `rgb(var(--x) / <alpha>)`
+   ile kullanır. Tema değişimi TEK bir data-theme niteliğiyle olur — her
+   bileşende `dark:` varyantı yazmaya gerek kalmaz.
+   ========================================================================== */
+
+:root,
+[data-theme='light'] {
+  --brand-50: 238 240 255;
+  --brand-100: 224 227 255;
+  --brand-200: 199 203 254;
+  --brand-300: 165 170 252;
+  --brand-400: 129 130 247;
+  --brand-500: 100 93 240;
+  --brand-600: 88 76 224;
+  --brand-700: 75 61 197;
+  --brand-800: 62 52 159;
+  --brand-900: 53 47 126;
+
+  --surface-base: 249 250 252;
+  --surface-raised: 255 255 255;
+  --surface-sunken: 242 244 248;
+  --surface-overlay: 255 255 255;
+
+  --ink: 24 27 38;
+  --ink-muted: 91 98 118;
+  --ink-subtle: 134 142 162;
+  --ink-inverse: 255 255 255;
+
+  --edge: 226 230 238;
+  --edge-strong: 205 211 223;
+
+  --ok: 22 137 82;
+  --warn: 180 118 8;
+  --danger: 205 45 45;
+  --info: 32 110 200;
+
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --brand-50: 240 240 255;
+  --brand-100: 224 226 255;
+  --brand-200: 197 200 253;
+  --brand-300: 163 167 250;
+  --brand-400: 133 134 246;
+  --brand-500: 121 116 244;
+  --brand-600: 103 94 236;
+  --brand-700: 88 78 214;
+  --brand-800: 71 63 173;
+  --brand-900: 57 51 137;
+
+  --surface-base: 13 15 22;
+  --surface-raised: 20 23 33;
+  --surface-sunken: 9 11 17;
+  --surface-overlay: 26 30 42;
+
+  --ink: 232 236 245;
+  --ink-muted: 150 160 180;
+  --ink-subtle: 108 118 138;
+  --ink-inverse: 13 15 22;
+
+  --edge: 38 43 58;
+  --edge-strong: 54 61 80;
+
+  --ok: 63 185 106;
+  --warn: 216 160 45;
+  --danger: 248 100 92;
+  --info: 88 160 255;
+
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-edge;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-surface-base text-ink antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Klavye ile gezinen kullanıcılar için görünür odak halkası (erişilebilirlik). */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand-500 ring-offset-2 ring-offset-surface-base;
+  }
+
+  ::selection {
+    @apply bg-brand-500/25;
+  }
+
+  /* İnce, temaya uyumlu kaydırma çubukları. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-edge-strong;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-ink-subtle;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-edge bg-surface-raised shadow-card;
+  }
+
+  .card-pad {
+    @apply p-5;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wider text-ink-muted;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-edge bg-surface-sunken px-3 py-2 text-sm text-ink
+           placeholder:text-ink-subtle
+           focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500
+           disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-lg px-3.5 py-2
+           text-sm font-medium transition-colors
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-600 text-white hover:bg-brand-500 active:bg-brand-700;
+  }
+
+  .btn-ghost {
+    @apply btn border border-edge bg-surface-raised text-ink hover:bg-surface-sunken;
+  }
+
+  .btn-danger {
+    @apply btn border border-danger/40 bg-danger/10 text-danger hover:bg-danger/20;
+  }
+
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5
+           text-xs font-medium;
+  }
+
+  .table-head {
+    @apply whitespace-nowrap px-4 py-2.5 text-left text-[11px] font-semibold
+           uppercase tracking-wider text-ink-muted;
+  }
+
+  .table-cell {
+    @apply px-4 py-3 align-top text-sm;
+  }
+
+  .mono {
+    @apply font-mono text-[12.5px];
+  }
+
+  .link {
+    @apply text-brand-400 underline-offset-2 hover:underline;
+  }
+}
