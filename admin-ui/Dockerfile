@@ -25,6 +25,13 @@ RUN npm run build
 # nginx-unprivileged: root olmayan kullanıcı, 8080 portu (NFR-3.3).
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 
+# Üstteki tag kayan (floating) bir minor sürüm; iki pull arasında upstream
+# Alpine paket deposu CVE yaması yayınlamış olabilir ama image katmanı henüz
+# yeniden build edilmemiş olabilir (bkz. CVE-2026-31789, libssl3/libcrypto3).
+# Build zamanında güncel yamaları çekmek, tag'in yeniden basılmasını
+# beklemeden Trivy taramasını (CRITICAL eşik, quality gate) geçirir.
+RUN apk upgrade --no-cache
+
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
