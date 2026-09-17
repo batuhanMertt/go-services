@@ -30,7 +30,13 @@ FROM nginxinc/nginx-unprivileged:1.27-alpine
 # yeniden build edilmemiş olabilir (bkz. CVE-2026-31789, libssl3/libcrypto3).
 # Build zamanında güncel yamaları çekmek, tag'in yeniden basılmasını
 # beklemeden Trivy taramasını (CRITICAL eşik, quality gate) geçirir.
+#
+# Base image varsayılan olarak non-root kullanıcıya (nginx) geçmiş durumda —
+# apk paket veritabanını kilitlemek root ister. Yükseltmeden sonra NFR-3.3
+# gereği non-root'a GERİ dönülür.
+USER root
 RUN apk upgrade --no-cache
+USER nginx
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
