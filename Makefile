@@ -5,7 +5,7 @@
 
 SHELL := /bin/bash
 COMPOSE := docker compose
-GO_IMAGE := golang:1.23.4-alpine
+GO_IMAGE := golang:1.26.8-alpine
 GO_RUN := docker run --rm -v "$(CURDIR)":/src -v go-mod-cache:/go/pkg/mod -w /src -e GOFLAGS=-mod=mod $(GO_IMAGE)
 
 # Go paketleri AÇIKÇA listelenir. `./...` kullanılsaydı admin-ui/node_modules

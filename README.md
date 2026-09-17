@@ -301,7 +301,7 @@ Tüm testler `-race` ile geçiyor.
 
 ```bash
 make test         # veya:
-docker run --rm -v "$PWD:/src" -w /src golang:1.23-alpine \
+docker run --rm -v "$PWD:/src" -w /src golang:1.26-alpine \
   go test ./internal/... ./services/... ./mock-tools/... ./tools/... -race -cover
 ```
 

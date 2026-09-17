@@ -16,7 +16,7 @@
 # =============================================================================
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.23.4-alpine AS builder
+FROM golang:1.26.8-alpine AS builder
 
 # git: bazı modüllerin çekilmesi için; ca-certificates: TLS doğrulaması.
 RUN apk add --no-cache git ca-certificates
