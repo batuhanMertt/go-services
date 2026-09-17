@@ -23,6 +23,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/mindmons/integration-hub/internal/cryptox"
+	"github.com/mindmons/integration-hub/internal/ddos"
 	"github.com/mindmons/integration-hub/internal/httpx"
 	"github.com/mindmons/integration-hub/internal/kafkax"
 	"github.com/mindmons/integration-hub/internal/logging"
@@ -35,15 +36,18 @@ import (
 
 // Server, event-ingest bağımlılıkları.
 type Server struct {
-	cfg     Config
-	log     *slog.Logger
-	store   *Store
-	pool    *pgxpool.Pool
-	rdb     *redis.Client
-	keys    *KeyCache
-	schemas *schema.Registry
-	limiter *ratelimit.Limiter
-	metrics *metrics.Registry
+	cfg      Config
+	log      *slog.Logger
+	store    *Store
+	pool     *pgxpool.Pool
+	rdb      *redis.Client
+	keys     *KeyCache
+	schemas  *schema.Registry
+	limiter  *ratelimit.Limiter
+	metrics  *metrics.Registry
+	conns    *ddos.ConnLimiter
+	detector *ddos.Detector
+	guard    *ddos.Guard
 
 	mIngested           *prometheus.CounterVec
 	mValidationErrors   *prometheus.CounterVec
@@ -118,6 +122,17 @@ func run() error {
 		schemas: schema.NewRegistry(),
 		limiter: ratelimit.New(rdb, cfg.RateFailClosed),
 		metrics: reg,
+		conns:   ddos.NewConnLimiter(cfg.MaxConcurrent),
+		detector: ddos.NewDetector(ddos.DetectorConfig{
+			Window:    cfg.AttackWindow,
+			Threshold: cfg.AttackThresholdRPS,
+			Cooldown:  cfg.AttackCooldown,
+		}),
+		guard: ddos.NewGuard(rdb, ddos.GuardConfig{
+			StrikeWindow:    cfg.BanStrikeWindow,
+			StrikeThreshold: cfg.BanStrikeThreshold,
+			BanTTL:          cfg.BanTTL,
+		}),
 	}
 	srv.registerMetrics(reg)
 
@@ -136,6 +151,13 @@ func run() error {
 	}
 
 	router := httpx.NewRouter(logger, reg, cfg.MaxBodyBytes)
+	// DDoS katmanı: eşzamanlı bağlantı tavanı + global saldırı-modu gözlemi.
+	// Bilinçli olarak router seviyesinde ve TÜM uçlara (healthz dahil)
+	// uygulanır — Recover/RequestLogger'dan SONRA eklendiği için chi bunları
+	// dıştan içe sarar, yani conns/Observe route handler'a en yakın halka
+	// olur; asıl koruma zaten Redis'e hiç gitmeyen bellek içi kontrollerdir.
+	router.Use(srv.conns.Middleware)
+	router.Use(ddos.Observe(srv.detector))
 	httpx.MountObservability(router, reg, health)
 	router.Post("/api/v1/events", srv.handleIngest)
 	router.Get("/api/v1/event-types", srv.handleListKnownTypes)

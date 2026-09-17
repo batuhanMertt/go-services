@@ -18,6 +18,21 @@ import (
 	"github.com/mindmons/integration-hub/internal/schema"
 )
 
+// adaptiveIPRule, saldırı modunda IP rate limitini sıkılaştırır. Detector
+// global istek hacmine bakar; ratelimit.Limiter tek bir IP'ye. İkisi
+// birlikte "saldırı sırasında herkesi eşit kesme, şüpheli hacmi kısıtla"
+// davranışını verir (bkz. internal/ddos paket dokümantasyonu).
+func adaptiveIPRule(base ratelimit.Rule, mult float64) ratelimit.Rule {
+	if mult >= 1.0 {
+		return base
+	}
+	rule := ratelimit.Rule{Rate: base.Rate * mult, Burst: int(float64(base.Burst) * mult)}
+	if rule.Burst < 1 {
+		rule.Burst = 1
+	}
+	return rule
+}
+
 // İstek başlıkları — kontrat docs/api-contracts/event-ingest.openapi.yaml.
 const (
 	HeaderAPIKey    = "X-Api-Key"
@@ -41,7 +56,9 @@ func typeKey(name string, version int) string {
 // handleIngest, publisher tool'lardan event kabul eder (FR-2.1).
 //
 // Doğrulama sırası bilinçlidir ve UCUZDAN PAHALIYA gider:
-//  1. IP rate limit  (Redis, DB'ye hiç gitmeden kötü niyetli trafiği keser)
+//  0. IP ban kontrolü (Redis EXISTS — Lua script'ten bile daha ucuz)
+//  1. IP rate limit  (Redis, DB'ye hiç gitmeden kötü niyetli trafiği keser;
+//     Detector saldırı modundaysa kural otomatik sıkılaştırılır)
 //  2. Başlık kontrolü (bellekte)
 //  3. API key doğrulama (önbellekli, gerekirse DB)
 //  4. Tool rate limit (kimlik belli olduktan sonra)
@@ -50,16 +67,29 @@ func typeKey(name string, version int) string {
 //  7. JSON Schema (CPU)
 //  8. DB yazımı (en pahalı)
 //
-// Böylece geçersiz bir istek en ucuz adımda reddedilir.
+// Böylece geçersiz bir istek en ucuz adımda reddedilir. 2-3-5 adımlarındaki
+// başarısızlıklar guard.Strike ile IP'nin itibarına işlenir: tekrarlayan
+// kötü niyetli istekler (geçersiz key, bozuk imza) belirli bir eşikten sonra
+// IP'yi geçici olarak banlar (bkz. internal/ddos.Guard).
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	traceID := httpx.TraceIDFromRequest(r)
 	receivedAt := time.Now().UTC()
-
-	// 1) IP bazlı rate limit
 	ip := httpx.ClientIP(r)
-	if res, err := s.limiter.Allow(ctx, "ip", ip,
-		ratelimit.Rule{Rate: s.cfg.RateIP.Rate, Burst: s.cfg.RateIP.Burst}); err != nil || !res.Allowed {
+
+	// 0) IP ban kontrolü
+	if s.guard.Banned(ctx, ip) {
+		s.mRateLimited.WithLabelValues("banned", "").Inc()
+		writeRetryAfter(w, time.Minute)
+		httpx.Error(w, r, httpx.Forbidden("ip_banned",
+			"bu IP tekrarlayan kötü niyetli istekler nedeniyle geçici olarak engellendi"))
+		return
+	}
+
+	// 1) IP bazlı rate limit — saldırı modunda daraltılmış kural
+	ipRule := adaptiveIPRule(ratelimit.Rule{Rate: s.cfg.RateIP.Rate, Burst: s.cfg.RateIP.Burst},
+		s.detector.Multiplier())
+	if res, err := s.limiter.Allow(ctx, "ip", ip, ipRule); err != nil || !res.Allowed {
 		if err != nil {
 			s.log.WarnContext(ctx, "ip rate limit kontrolü başarısız", "err", err.Error())
 		}
@@ -77,11 +107,13 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	timestamp := r.Header.Get(HeaderTimestamp)
 
 	if apiKey == "" {
+		s.guard.Strike(ctx, ip)
 		s.mIngested.WithLabelValues("", "", "unauthorized").Inc()
 		httpx.Error(w, r, httpx.Unauthorized("missing_api_key", HeaderAPIKey+" başlığı zorunlu"))
 		return
 	}
 	if signature == "" || timestamp == "" {
+		s.guard.Strike(ctx, ip)
 		s.mIngested.WithLabelValues("", "", "unauthorized").Inc()
 		httpx.Error(w, r, httpx.Unauthorized("missing_signature",
 			HeaderSignature+" ve "+HeaderTimestamp+" başlıkları zorunlu"))
@@ -112,7 +144,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrToolBlocked), errors.Is(err, ErrNotPublisher):
 			httpx.Error(w, r, httpx.Forbidden("tool_not_allowed", err.Error()))
 		default:
+			// Tanınmayan/geçersiz key: credential-guessing sinyali, itibara işlenir.
 			// Ayrıntı verilmez: hangi anahtarın var olduğu bilgisi sızmamalı.
+			s.guard.Strike(ctx, ip)
 			httpx.Error(w, r, httpx.Unauthorized("invalid_api_key", "api key geçersiz"))
 		}
 		return
@@ -139,6 +173,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		s.log.WarnContext(ctx, "imza doğrulanamadı",
 			"tool", tool.ToolSlug, "err", err.Error())
 
+		s.guard.Strike(ctx, ip)
 		switch {
 		case errors.Is(err, cryptox.ErrTimestampExpired), errors.Is(err, cryptox.ErrTimestampInvalid):
 			httpx.Error(w, r, httpx.Unauthorized("stale_timestamp",

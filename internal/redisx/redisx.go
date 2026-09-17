@@ -85,6 +85,7 @@ const (
 	NSRules     = "rules"   // rules:{event_type}
 	NSBreaker   = "breaker" // breaker:{subscription_id}
 	NSIdem      = "idem"    // idem:{event_id}
+	NSGuard     = "guard"   // guard:{strikes|ban}:{ip}
 )
 
 // Key, isim alanlı bir Redis anahtarı üretir.
