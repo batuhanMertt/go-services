@@ -230,8 +230,8 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get("X-Hub-Signature-256")
 	timestamp := r.Header.Get("X-Hub-Timestamp")
 
-	switch {
-	case signature == "":
+	switch signature {
+	case "":
 		c.Signature = "missing"
 	default:
 		if err := cryptox.VerifyRequest([]byte(s.cfg.SigningKey), timestamp, body, signature, s.cfg.HMACWindow); err != nil {

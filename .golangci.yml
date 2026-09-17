@@ -1,23 +1,23 @@
 # =============================================================================
-# golangci-lint yapılandırması
+# golangci-lint yapılandırması (v2 şeması)
 #
 # Prensip: gürültü değil, sinyal. Etkinleştirilen her linter gerçek bir hata
 # sınıfını yakalar. "Stil polisi" linter'lar (lll, gochecknoglobals, wsl)
 # bilinçli olarak kapalı — gofmt zaten biçimi belirliyor.
 # =============================================================================
+version: "2"
+
 run:
-  timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     # --- Doğruluk ------------------------------------------------------------
     - errcheck      # kontrol edilmeyen hata dönüşleri
     - govet         # shadow, printf, atomic, copylocks
-    - staticcheck   # kapsamlı statik analiz
+    - staticcheck   # kapsamlı statik analiz (gosimple dahil, bkz. settings)
     - ineffassign   # kullanılmayan atamalar
-    - typecheck     # derleme hataları
     - bodyclose     # kapatılmayan HTTP response body → dosya tanıtıcı sızıntısı
     - rowserrcheck  # sql.Rows.Err() kontrolü — sessiz veri kaybını önler
     - sqlclosecheck # kapatılmayan sql.Rows
@@ -28,85 +28,112 @@ linters:
 
     # --- Sadelik ve okunabilirlik --------------------------------------------
     - unused        # ölü kod
-    - gosimple      # gereksiz karmaşıklık
     - unconvert     # gereksiz tip dönüşümü
-    - goimports     # import düzeni
 
     # --- Kaynak yönetimi ------------------------------------------------------
     - noctx         # context'siz HTTP isteği → timeout'suz istek riski
     - errorlint     # hatalı errors.Is/As kullanımı
 
-# --- Bilinçli olarak DEVRE DIŞI bırakılanlar --------------------------------
-#
-# misspell      : Kod yorumları Türkçedir. Linter yalnızca İngilizce sözlük
-#                 kullandığı için "performans" → "performances", "adres" →
-#                 "address" gibi yüzlerce yanlış pozitif üretiyor. Gerçek
-#                 yazım hatalarını bunların arasında görmek imkânsız hâle
-#                 geliyor; sinyal/gürültü oranı kabul edilemez.
-#
-# contextcheck  : Bu kod tabanında BİLİNÇLİ olarak parent'tan türetilmeyen
-#                 dört context var ve hepsi doğru:
-#                   1-2) graceful shutdown — parent zaten iptal edilmiş
-#                        durumda; ondan türetmek kapanışı anında iptal eder.
-#                   3)   panic recovery — iptal edilmiş context'te bile
-#                        yanıt yazılabilmeli.
-#                   4)   touchKeyOccasionally — yanıt döndükten sonra devam
-#                        eden fire-and-forget güncelleme.
-#                 Linter bunları çağrı noktasında raporladığı için nolint
-#                 yorumu tanımıyor. Her biri kodda ayrıca açıklanmıştır.
+  # --- Bilinçli olarak DEVRE DIŞI bırakılanlar ------------------------------
+  #
+  # misspell      : Kod yorumları Türkçedir. Linter yalnızca İngilizce sözlük
+  #                 kullandığı için "performans" → "performances", "adres" →
+  #                 "address" gibi yüzlerce yanlış pozitif üretiyor. Gerçek
+  #                 yazım hatalarını bunların arasında görmek imkânsız hâle
+  #                 geliyor; sinyal/gürültü oranı kabul edilemez.
+  #
+  # contextcheck  : Bu kod tabanında BİLİNÇLİ olarak parent'tan türetilmeyen
+  #                 dört context var ve hepsi doğru:
+  #                   1-2) graceful shutdown — parent zaten iptal edilmiş
+  #                        durumda; ondan türetmek kapanışı anında iptal eder.
+  #                   3)   panic recovery — iptal edilmiş context'te bile
+  #                        yanıt yazılabilmeli.
+  #                   4)   touchKeyOccasionally — yanıt döndükten sonra devam
+  #                        eden fire-and-forget güncelleme.
+  #                 Linter bunları çağrı noktasında raporladığı için nolint
+  #                 yorumu tanımıyor. Her biri kodda ayrıca açıklanmıştır.
+  #
+  # typecheck/gosimple: v2'de ayrı linter değil — typecheck derleyicinin
+  #                 kendisi tarafından her zaman uygulanır; gosimple'ın
+  #                 kontrolleri staticcheck'in "all" seti içine taşındı
+  #                 (aşağıdaki settings.staticcheck.checks).
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: false
-    exclude-functions:
-      # Bunlar bilinçli olarak yok sayılıyor; hata yönetimi anlamsız.
-      - (net/http.ResponseWriter).Write
-      - (io.Closer).Close
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+      exclude-functions:
+        # Bunlar bilinçli olarak yok sayılıyor; hata yönetimi anlamsız.
+        - (net/http.ResponseWriter).Write
+        - (io.Closer).Close
 
-  govet:
-    # `shadow` BİLİNÇLİ olarak kapalı. Go'nun en yaygın deyimi olan
-    #   if err := f(); err != nil { ... }
-    # dış kapsamda bir `err` varsa her seferinde uyarı üretir. Bu, gerçek
-    # gölgeleme hatalarını yüzlerce yanlış pozitif arasında kaybettirir.
-    # Gerçek gölgeleme riski olan yerler (uzun fonksiyonlarda yeniden
-    # kullanılan değişkenler) kod incelemesinde yakalanır.
-    enable-all: false
-    disable:
-      - fieldalignment  # bellek hizalaması bu ölçekte mikro-optimizasyon
+    govet:
+      # `shadow` BİLİNÇLİ olarak kapalı. Go'nun en yaygın deyimi olan
+      #   if err := f(); err != nil { ... }
+      # dış kapsamda bir `err` varsa her seferinde uyarı üretir. Bu, gerçek
+      # gölgeleme hatalarını yüzlerce yanlış pozitif arasında kaybettirir.
+      # Gerçek gölgeleme riski olan yerler (uzun fonksiyonlarda yeniden
+      # kullanılan değişkenler) kod incelemesinde yakalanır.
+      enable-all: false
+      disable:
+        - fieldalignment  # bellek hizalaması bu ölçekte mikro-optimizasyon
 
-  gosec:
-    excludes:
-      - G404 # math/rand: jitter ve örnekleme için kriptografik güvenlik gerekmiyor
-      - G107 # değişken URL ile HTTP isteği: webhook teslimatının doğası bu
-      - G101 # HTTP başlık ADLARINI ("X-Api-Key") gömülü secret sanıyor
+    gosec:
+      excludes:
+        - G404 # math/rand: jitter ve örnekleme için kriptografik güvenlik gerekmiyor
+        - G107 # değişken URL ile HTTP isteği: webhook teslimatının doğası bu
+        - G101 # HTTP başlık ADLARINI ("X-Api-Key") gömülü secret sanıyor
+        - G117 # struct JSON'a yazılırken "APIKey" alan adını secret sızıntısı sanıyor
+               # (internal/toolkit/credstore.go: mock tool'un KENDİ anahtarını
+               # 0600 izinli yerel dosyaya yazması — kasıtlı, sızıntı değil)
+        - G704 # taint analiziyle SSRF sanıyor (tools/healthcheck): URL, operatörün
+               # verdiği HEALTHCHECK_URL env değişkeni — G107 ile aynı gerekçe
 
-  staticcheck:
-    checks: ['all']
+    staticcheck:
+      checks:
+        - all
+        - -ST1020 # "Name, açıklama" yorum kuralı Türkçe dokümantasyon
+                  # konvansiyonuyla çatışıyor — misspell'in kapatılma
+                  # gerekçesiyle aynı: gerçek sinyali gürültüye gömer
+        - -ST1021 # aynı kural, exported type'lar için
+        - -ST1022 # aynı kural, exported const/var için
 
-
-  goimports:
-    local-prefixes: github.com/mindmons/integration-hub
+  exclusions:
+    generated: lax
+    paths:
+      - admin-ui/node_modules
+      - admin-ui/dist
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+      # Testlerde hata kontrolü ve güvenlik kuralları gevşetilir.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - bodyclose
+          - noctx
+      # main.go'da os.Exit sonrası defer uyarısı beklenen davranış.
+      - path: main\.go
+        text: 'using os.Exit'
 
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-use-default: false
 
-  # node_modules içindeki üçüncü taraf Go dosyaları taranmasın.
-  exclude-dirs:
-    - admin-ui/node_modules
-    - admin-ui/dist
-
-  exclude-rules:
-    # Testlerde hata kontrolü ve güvenlik kuralları gevşetilir.
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-        - bodyclose
-        - noctx
-
-    # main.go'da os.Exit sonrası defer uyarısı beklenen davranış.
-    - path: main\.go
-      text: 'using os.Exit'
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/mindmons/integration-hub
+  exclusions:
+    generated: lax
+    paths:
+      - admin-ui/node_modules
+      - admin-ui/dist
+      - third_party$
+      - builtin$
+      - examples$
